@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  api1: &api
+    build: .
+    environment:
+      - NODE_ENV=production
+    networks:
+      - backend
+
+  api2:
+    <<: *api
+    environment:
+      - NODE_ENV=production
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - '9999:9999'
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - api1
+      - api2
+    networks:
+      - backend
+
+networks:
+  backend:
+    driver: bridge
