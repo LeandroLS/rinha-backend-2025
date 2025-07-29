@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "npm run build && node dist/index.js"
+    "dev": "npm run build && node dist/index.js",
+    "start": "node dist/index.js"
   },
   "repository": {
     "type": "git",
@@ -19,7 +20,8 @@
   },
   "homepage": "https://github.com/LeandroLS/rinha-backend-2025#readme",
   "dependencies": {
-    "fastify": "^5.4.0"
+    "fastify": "^5.4.0",
+    "redis": "^5.6.1"
   },
   "devDependencies": {
     "@types/node": "^24.1.0",

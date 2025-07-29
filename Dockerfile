@@ -9,7 +9,7 @@ COPY tsconfig.json ./
 COPY index.ts ./
 
 RUN npm run build
-RUN npm prune --production
+RUN npm prune
 
 EXPOSE 3000
 
