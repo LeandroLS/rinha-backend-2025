@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node index.js"
+    "start": "npm run build && node dist/index.js"
   },
   "repository": {
     "type": "git",
