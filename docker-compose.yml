@@ -14,7 +14,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.60'
+          cpus: '0.55'
           memory: '100MB'
 
   api2:
@@ -27,7 +27,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.60'
+          cpus: '0.55'
           memory: '100MB'
 
   redis:
@@ -37,7 +37,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.30'
+          cpus: '0.25'
           memory: '80MB'
 
   nginx:
@@ -51,6 +51,11 @@ services:
       - api2
     networks:
       - backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.15'
+          memory: '15MB'
 
 networks:
   backend:

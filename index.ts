@@ -99,7 +99,7 @@ async function processPaymentQueue() {
       const item = await redis.brPop('payment_queue', 1)
       if (item) {
         const payment = JSON.parse(item.element)
-        await processPaymentByDefault(payment)
+        await processPaymentWithProcessor(payment, 'default')
         console.log('Queue size:', await redis.lLen('payment_queue'))
       }
     } catch (error) {
@@ -120,51 +120,39 @@ async function tryProcessor(
   }
   console.log(`${processorType} processor failed, trying ${processorType === 'default' ? 'fallback' : 'default'}`)
   if (processorType === 'default') {
-    return await processPaymentByFallback(payment)
+    return await processPaymentWithProcessor(payment, 'fallback')
   } else {
-    return await processPaymentByDefault(payment)
+    return await processPaymentWithProcessor(payment, 'default')
   }
 }
 
-async function processPaymentByFallback(payment: Payment): Promise<boolean | void> {
-  let isFallBackAvailable = false
+async function processPaymentWithProcessor(
+  payment: Payment,
+  processorType: 'default' | 'fallback'
+): Promise<boolean | void> {
   try {
-    console.log(`Trying to process by fallback: ${payment.correlationId}`)
-    const alreadyMadeRequest = await redis.get(`${fallbackProcessorUrl}:/payments/service-health`)
-    if (alreadyMadeRequest) {
-      if (isFallBackAvailable) {
-        return await tryProcessor(payment, fallbackProcessorUrl, 'fallback')
-      }
-      return await tryProcessor(payment, defaultProcessorUrl, 'default')
-    }
-    isFallBackAvailable = await isProcessorHealthy(fallbackProcessorUrl)
-    if (isFallBackAvailable) {
-      return await tryProcessor(payment, fallbackProcessorUrl, 'fallback')
-    }
-    return await processPaymentByDefault(payment)
-  } catch (error) {
-    console.error('Error with fallback processor:', payment.correlationId, error)
-  }
-}
+    const processorUrl = processorType === 'default' ? defaultProcessorUrl : fallbackProcessorUrl
+    const fallbackProcessorType = processorType === 'default' ? 'fallback' : 'default'
 
-async function processPaymentByDefault(payment: Payment): Promise<boolean | void> {
-  try {
-    let isDefaultAvailable = false
-    console.log('Trying to process by default:', payment.correlationId)
-    const alreadyMadeRequest = await redis.get(`${defaultProcessorUrl}:/payments/service-health`)
+    let isProcessorAvailable = false
+    console.log(`Trying to process by ${processorType}: ${payment.correlationId}`)
+
+    const alreadyMadeRequest = await redis.get(`${processorUrl}:/payments/service-health`)
     if (alreadyMadeRequest) {
-      if (isDefaultAvailable) {
-        return await tryProcessor(payment, defaultProcessorUrl, 'default')
+      if (isProcessorAvailable) {
+        return await tryProcessor(payment, processorUrl, processorType)
       }
-      return await processPaymentByFallback(payment)
+      const fallbackUrl = processorType === 'default' ? fallbackProcessorUrl : defaultProcessorUrl
+      return await tryProcessor(payment, fallbackUrl, fallbackProcessorType)
     }
-    isDefaultAvailable = await isProcessorHealthy(defaultProcessorUrl)
-    if (isDefaultAvailable) {
-      return await tryProcessor(payment, defaultProcessorUrl, 'default')
+
+    isProcessorAvailable = await isProcessorHealthy(processorUrl)
+    if (isProcessorAvailable) {
+      return await tryProcessor(payment, processorUrl, processorType)
     }
-    return await processPaymentByFallback(payment)
+    return await processPaymentWithProcessor(payment, fallbackProcessorType)
   } catch (error) {
-    console.error('Error processing payment:', payment.correlationId, error)
+    console.error(`Error with ${processorType} processor:`, payment.correlationId, error)
   }
 }
 
