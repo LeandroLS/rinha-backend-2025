@@ -108,39 +108,22 @@ async function processPaymentQueue() {
   }
 }
 
-async function tryProcessPayment(payment: Payment, processor: 'default' | 'fallback') {
-  let processorUrl = defaultProcessorUrl
-  if (processor == 'fallback') {
-    processorUrl = fallbackProcessorUrl
-  }
+async function tryProcessor(
+  payment: Payment,
+  processorUrl: string,
+  processorType: 'default' | 'fallback'
+) {
   const success = await processWithProcessor(payment, processorUrl)
   if (success) {
-    console.log(`${processor} processor success, saving processment`)
-    return await saveProcessedPayment(payment, 'default')
+    console.log(`${processorType} processor success, saving processment`)
+    return await saveProcessedPayment(payment, processorType)
   }
-
-  console.log(`${processor} processor failed, trying fallback`)
-  return await processPaymentByFallback(payment)
-}
-
-async function tryDefaultProcessor(payment: Payment, defaultProcessorUrl: string) {
-  const success = await processWithProcessor(payment, defaultProcessorUrl)
-  if (success) {
-    console.log('Default processor success, saving processment')
-    return await saveProcessedPayment(payment, 'default')
+  console.log(`${processorType} processor failed, trying ${processorType === 'default' ? 'fallback' : 'default'}`)
+  if (processorType === 'default') {
+    return await processPaymentByFallback(payment)
+  } else {
+    return await processPaymentByDefault(payment)
   }
-  console.log('Default processor failed, trying fallback')
-  return await processPaymentByFallback(payment)
-}
-
-async function tryFallBackProcessor(payment: Payment, fallbackProcessorUrl: string) {
-  const success = await processWithProcessor(payment, fallbackProcessorUrl)
-  if (success) {
-    console.log('fallbackprocess success, saving processment')
-    return await saveProcessedPayment(payment, 'fallback')
-  }
-  console.log('fallback processor failed, trying default')
-  return await processPaymentByDefault(payment)
 }
 
 async function processPaymentByFallback(payment: Payment): Promise<boolean | void> {
@@ -150,13 +133,13 @@ async function processPaymentByFallback(payment: Payment): Promise<boolean | voi
     const alreadyMadeRequest = await redis.get(`${fallbackProcessorUrl}:/payments/service-health`)
     if (alreadyMadeRequest) {
       if (isFallBackAvailable) {
-        return await tryFallBackProcessor(payment, fallbackProcessorUrl)
+        return await tryProcessor(payment, fallbackProcessorUrl, 'fallback')
       }
-      return await tryDefaultProcessor(payment, defaultProcessorUrl)
+      return await tryProcessor(payment, defaultProcessorUrl, 'default')
     }
-    isFallBackAvailable = await isProcessorHealthy(defaultProcessorUrl)
+    isFallBackAvailable = await isProcessorHealthy(fallbackProcessorUrl)
     if (isFallBackAvailable) {
-      return await tryFallBackProcessor(payment, fallbackProcessorUrl)
+      return await tryProcessor(payment, fallbackProcessorUrl, 'fallback')
     }
     return await processPaymentByDefault(payment)
   } catch (error) {
@@ -164,20 +147,20 @@ async function processPaymentByFallback(payment: Payment): Promise<boolean | voi
   }
 }
 
-async function processPaymentByDefault(payment: Payment) {
+async function processPaymentByDefault(payment: Payment): Promise<boolean | void> {
   try {
     let isDefaultAvailable = false
     console.log('Trying to process by default:', payment.correlationId)
     const alreadyMadeRequest = await redis.get(`${defaultProcessorUrl}:/payments/service-health`)
     if (alreadyMadeRequest) {
       if (isDefaultAvailable) {
-        return await tryDefaultProcessor(payment, defaultProcessorUrl)
+        return await tryProcessor(payment, defaultProcessorUrl, 'default')
       }
       return await processPaymentByFallback(payment)
     }
     isDefaultAvailable = await isProcessorHealthy(defaultProcessorUrl)
     if (isDefaultAvailable) {
-      return await tryDefaultProcessor(payment, defaultProcessorUrl)
+      return await tryProcessor(payment, defaultProcessorUrl, 'default')
     }
     return await processPaymentByFallback(payment)
   } catch (error) {
