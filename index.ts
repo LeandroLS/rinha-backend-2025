@@ -15,7 +15,10 @@ const fallbackProcessorUrl = process.env.PROCESSOR_FALLBACK_URL!
 redis.on('error', (err) => console.log('Redis Client Error', err))
 
 await redis.connect()
+console.log('Cleaning Redis data...')
+await redis.flushDb()
 await redis.del('payment_queue');
+console.log('Redis cleaned!')
 
 await fetch(defaultProcessorUrl + '/admin/purge-payments', {
   method: 'POST',
@@ -30,18 +33,9 @@ type Payment = {
 }
 
 async function saveProcessedPayment(payment: Payment, processor: 'default' | 'fallback') {
-  const timestamp = new Date().toISOString()
-
-  // Pipeline - executa todas as operações em uma única requisição ao Redis
   const pipeline = redis.multi()
 
-  pipeline.hSet(`p:${payment.correlationId}`, {
-    correlationId: payment.correlationId,
-    amount: payment.amount.toString(),
-    processor,
-    processedAt: timestamp,
-  })
-
+  // Stats globais (sem data)
   pipeline.hIncrBy(`stats:${processor}`, 'totalRequests', 1)
   pipeline.hIncrByFloat(`stats:${processor}`, 'totalAmount', payment.amount)
 
@@ -50,8 +44,11 @@ async function saveProcessedPayment(payment: Payment, processor: 'default' | 'fa
 
 async function getPaymentsSummary(from?: string, to?: string) {
   if (!from && !to) {
-    const defaultStats = await redis.hGetAll('stats:default')
-    const fallbackStats = await redis.hGetAll('stats:fallback')
+    // Sem filtro de data - usa stats globais (super rápido)
+    const [defaultStats, fallbackStats] = await Promise.all([
+      redis.hGetAll('stats:default'),
+      redis.hGetAll('stats:fallback')
+    ])
 
     return {
       default: {
