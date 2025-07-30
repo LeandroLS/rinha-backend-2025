@@ -14,17 +14,20 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.55'
+          cpus: '0.60'
           memory: '100MB'
 
   api2:
     <<: *api
     environment:
+      - NODE_ENV=production
+      - PROCESSOR_DEFAULT_URL=http://payment-processor-default:8080
+      - PROCESSOR_FALLBACK_URL=http://payment-processor-fallback:8080
       - INSTANCE_ID=API-2
     deploy:
       resources:
         limits:
-          cpus: '0.55'
+          cpus: '0.60'
           memory: '100MB'
 
   redis:
@@ -34,7 +37,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.2'
+          cpus: '0.30'
           memory: '80MB'
 
   nginx:

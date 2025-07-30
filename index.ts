@@ -15,20 +15,32 @@ const fallbackProcessorUrl = process.env.PROCESSOR_FALLBACK_URL!
 redis.on('error', (err) => console.log('Redis Client Error', err))
 
 await redis.connect()
+await redis.del('payment_queue');
 
-async function saveProcessedPayment(payment: any, processor: 'default' | 'fallback', success: boolean) {
+await fetch(defaultProcessorUrl + '/admin/purge-payments', {
+  method: 'POST',
+})
+await fetch(fallbackProcessorUrl + '/admin/purge-payments', {
+  method: 'POST',
+})
+
+type Payment = {
+  amount: number,
+  correlationId: string,
+}
+
+async function saveProcessedPayment(payment: Payment, processor: 'default' | 'fallback') {
   const timestamp = new Date().toISOString()
 
   await redis.hSet(`p:${payment.correlationId}`, {
     correlationId: payment.correlationId,
     amount: payment.amount.toString(),
     processor,
-    success: success.toString(),
     processedAt: timestamp,
   })
 
   await redis.hIncrBy(`stats:${processor}`, 'totalRequests', 1)
-  await redis.hIncrByFloat(`stats:${processor}`, 'totalAmount', success ? payment.amount : 0)
+  await redis.hIncrByFloat(`stats:${processor}`, 'totalAmount', payment.amount)
 }
 
 async function getPaymentsSummary(from?: string, to?: string) {
@@ -61,18 +73,12 @@ async function getPaymentsSummary(from?: string, to?: string) {
 
     if (processedAt >= fromDate && processedAt <= toDate) {
       const amount = parseFloat(payment.amount)
-      const success = payment.success === 'true'
-
       if (payment.processor === 'default') {
         defaultResult.totalRequests++
-        if (success) {
-          defaultResult.totalAmount += amount
-        }
+        defaultResult.totalAmount += amount
       } else if (payment.processor === 'fallback') {
         fallbackResult.totalRequests++
-        if (success) {
-          fallbackResult.totalAmount += amount
-        }
+        fallbackResult.totalAmount += amount
       }
     }
   }
@@ -83,63 +89,109 @@ async function getPaymentsSummary(from?: string, to?: string) {
   }
 }
 
-async function addPaymentToQueue(paymentData: any) {
+async function addPaymentToQueue(paymentData: Payment) {
   await redis.lPush('payment_queue', JSON.stringify(paymentData))
 }
 
 async function processPaymentQueue() {
   while (true) {
     try {
-      const item = await redis.rPop('payment_queue')
+      const item = await redis.brPop('payment_queue', 1)
       if (item) {
-        const payment = JSON.parse(item)
-        await processPayment(payment)
+        const payment = JSON.parse(item.element)
+        await processPaymentByDefault(payment)
+        console.log('Queue size:', await redis.lLen('payment_queue'))
       }
     } catch (error) {
       console.error('Error processing payment queue:', error)
-      await new Promise(resolve => setTimeout(resolve, 1000))
     }
   }
 }
 
-async function processPayment(payment: any) {
+async function tryProcessPayment(payment: Payment, processor: 'default' | 'fallback') {
+  let processorUrl = defaultProcessorUrl
+  if (processor == 'fallback') {
+    processorUrl = fallbackProcessorUrl
+  }
+  const success = await processWithProcessor(payment, processorUrl)
+  if (success) {
+    console.log(`${processor} processor success, saving processment`)
+    return await saveProcessedPayment(payment, 'default')
+  }
+
+  console.log(`${processor} processor failed, trying fallback`)
+  return await processPaymentByFallback(payment)
+}
+
+async function tryDefaultProcessor(payment: Payment, defaultProcessorUrl: string) {
+  const success = await processWithProcessor(payment, defaultProcessorUrl)
+  if (success) {
+    console.log('Default processor success, saving processment')
+    return await saveProcessedPayment(payment, 'default')
+  }
+  console.log('Default processor failed, trying fallback')
+  return await processPaymentByFallback(payment)
+}
+
+async function tryFallBackProcessor(payment: Payment, fallbackProcessorUrl: string) {
+  const success = await processWithProcessor(payment, fallbackProcessorUrl)
+  if (success) {
+    console.log('fallbackprocess success, saving processment')
+    return await saveProcessedPayment(payment, 'fallback')
+  }
+  console.log('fallback processor failed, trying default')
+  return await processPaymentByDefault(payment)
+}
+
+async function processPaymentByFallback(payment: Payment): Promise<boolean | void> {
+  let isFallBackAvailable = false
   try {
-    console.log('Processing payment:', payment.correlationId)
-
-    // Check if default processor is available
-    const isDefaultAvailable = await isProcessorHealthy(defaultProcessorUrl)
-    if (!isDefaultAvailable) {
-      console.log('Default processor not available, trying fallback')
-      return await tryFallbackProcessor(payment)
+    console.log(`Trying to process by fallback: ${payment.correlationId}`)
+    const alreadyMadeRequest = await redis.get(`${fallbackProcessorUrl}:/payments/service-health`)
+    if (alreadyMadeRequest) {
+      if (isFallBackAvailable) {
+        return await tryFallBackProcessor(payment, fallbackProcessorUrl)
+      }
+      return await tryDefaultProcessor(payment, defaultProcessorUrl)
     }
-
-    // Try to process with default processor
-    console.log('Default processor is healthy')
-    const success = await processWithProcessor(payment, defaultProcessorUrl)
-    if (success) {
-      return await saveProcessedPayment(payment, 'default', true)
+    isFallBackAvailable = await isProcessorHealthy(defaultProcessorUrl)
+    if (isFallBackAvailable) {
+      return await tryFallBackProcessor(payment, fallbackProcessorUrl)
     }
+    return await processPaymentByDefault(payment)
+  } catch (error) {
+    console.error('Error with fallback processor:', payment.correlationId, error)
+  }
+}
 
-    // Default processing failed, try fallback
-    console.log('Default processor failed, trying fallback')
-    await tryFallbackProcessor(payment)
-
+async function processPaymentByDefault(payment: Payment) {
+  try {
+    let isDefaultAvailable = false
+    console.log('Trying to process by default:', payment.correlationId)
+    const alreadyMadeRequest = await redis.get(`${defaultProcessorUrl}:/payments/service-health`)
+    if (alreadyMadeRequest) {
+      if (isDefaultAvailable) {
+        return await tryDefaultProcessor(payment, defaultProcessorUrl)
+      }
+      return await processPaymentByFallback(payment)
+    }
+    isDefaultAvailable = await isProcessorHealthy(defaultProcessorUrl)
+    if (isDefaultAvailable) {
+      return await tryDefaultProcessor(payment, defaultProcessorUrl)
+    }
+    return await processPaymentByFallback(payment)
   } catch (error) {
     console.error('Error processing payment:', payment.correlationId, error)
-    await saveProcessedPayment(payment, 'default', false)
   }
 }
 
 async function isProcessorHealthy(processorUrl: string): Promise<boolean> {
-  try {
-    const response = await fetch(processorUrl + '/payments/service-health')
-    if (!response.ok) return false
-
-    const health = await response.json()
-    return health.failing === false
-  } catch {
-    return false
-  }
+  const response = await fetch(processorUrl + '/payments/service-health')
+  await redis.setEx(`${processorUrl}:/payments/service-health`, 5, '1');
+  if (!response.ok) return false
+  const health = await response.json()
+  if (health.failing === false) return true
+  return false
 }
 
 async function processWithProcessor(payment: any, processorUrl: string): Promise<boolean> {
@@ -162,25 +214,6 @@ async function processWithProcessor(payment: any, processorUrl: string): Promise
   }
 }
 
-async function tryFallbackProcessor(payment: any) {
-  try {
-    console.log(`Trying fallback processor for payment: ${payment.correlationId}`)
-
-    const success = await processWithProcessor(payment, fallbackProcessorUrl)
-    await saveProcessedPayment(payment, 'fallback', success)
-
-    if (success) {
-      console.log(`Payment ${payment.correlationId} processed with fallback`)
-    } else {
-      console.log(`Payment ${payment.correlationId} failed on both processors`)
-    }
-
-  } catch (error) {
-    console.error('Error with fallback processor:', payment.correlationId, error)
-    await saveProcessedPayment(payment, 'fallback', false)
-  }
-}
-
 processPaymentQueue()
 
 const schema = {
@@ -188,7 +221,7 @@ const schema = {
     type: 'object',
     required: ['correlationId', 'amount'],
     properties: {
-      amount: { type: 'number', multipleOf: 0.01, minimum: 0.01 },
+      amount: { type: 'number', minimum: 0.01 },
       correlationId: { type: 'string', format: 'uuid' },
     }
   },
@@ -201,7 +234,7 @@ const schema = {
 
 fastify.post('/payments', { schema }, async function handler(request, reply) {
   try {
-    await addPaymentToQueue(request.body)
+    await addPaymentToQueue(request.body as Payment)
     reply.code(200).send()
   } catch (error) {
     fastify.log.error('Error adding payment to queue:', error)
