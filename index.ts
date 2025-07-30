@@ -32,15 +32,20 @@ type Payment = {
 async function saveProcessedPayment(payment: Payment, processor: 'default' | 'fallback') {
   const timestamp = new Date().toISOString()
 
-  await redis.hSet(`p:${payment.correlationId}`, {
+  // Pipeline - executa todas as operações em uma única requisição ao Redis
+  const pipeline = redis.multi()
+
+  pipeline.hSet(`p:${payment.correlationId}`, {
     correlationId: payment.correlationId,
     amount: payment.amount.toString(),
     processor,
     processedAt: timestamp,
   })
 
-  await redis.hIncrBy(`stats:${processor}`, 'totalRequests', 1)
-  await redis.hIncrByFloat(`stats:${processor}`, 'totalAmount', payment.amount)
+  pipeline.hIncrBy(`stats:${processor}`, 'totalRequests', 1)
+  pipeline.hIncrByFloat(`stats:${processor}`, 'totalAmount', payment.amount)
+
+  await pipeline.exec()
 }
 
 async function getPaymentsSummary(from?: string, to?: string) {
@@ -93,19 +98,52 @@ async function addPaymentToQueue(paymentData: Payment) {
   await redis.lPush('payment_queue', JSON.stringify(paymentData))
 }
 
-async function processPaymentQueue() {
+async function processPaymentWorker(workerId: number) {
   while (true) {
     try {
-      const item = await redis.brPop('payment_queue', 1)
-      if (item) {
-        const payment = JSON.parse(item.element)
-        await processPaymentWithProcessor(payment, 'default')
-        console.log('Queue size:', await redis.lLen('payment_queue'))
+      const batchSize = 20
+      const batch = []
+
+      for (let i = 0; i < batchSize; i++) {
+        const item = await redis.rPop('payment_queue')
+        if (item) {
+          batch.push(JSON.parse(item))
+        } else {
+          break
+        }
       }
+
+      if (batch.length > 0) {
+        const promises = batch.map(payment =>
+          processPaymentWithProcessor(payment, 'default')
+        )
+
+        await Promise.all(promises)
+        const queueSize = await redis.lLen('payment_queue')
+        console.log(`Processed batch of ${batch.length}, queue size: ${queueSize}`)
+
+      } else {
+        // Se não há itens, espera um pouco antes de tentar novamente
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+
     } catch (error) {
-      console.error('Error processing payment queue:', error)
+      console.error(`Worker ${workerId} error:`, error)
+      await new Promise(resolve => setTimeout(resolve, 100))
     }
   }
+}
+
+async function startPaymentWorkers() {
+  const numWorkers = 10 // 4 workers por API (total 8)
+
+  console.log(`Starting ${numWorkers} payment workers...`)
+
+  const workers = Array.from({ length: numWorkers }, (_, i) =>
+    processPaymentWorker(i + 1)
+  )
+
+  await Promise.all(workers)
 }
 
 async function tryProcessor(
@@ -115,7 +153,7 @@ async function tryProcessor(
 ) {
   const success = await processWithProcessor(payment, processorUrl)
   if (success) {
-    console.log(`${processorType} processor success, saving processment`)
+    // console.log(`${processorType} processor success, saving processment`)
     return await saveProcessedPayment(payment, processorType)
   }
   console.log(`${processorType} processor failed, trying ${processorType === 'default' ? 'fallback' : 'default'}`)
@@ -135,7 +173,7 @@ async function processPaymentWithProcessor(
     const fallbackProcessorType = processorType === 'default' ? 'fallback' : 'default'
 
     let isProcessorAvailable = false
-    console.log(`Trying to process by ${processorType}: ${payment.correlationId}`)
+    // console.log(`Trying to process by ${processorType}: ${payment.correlationId}`)
 
     const alreadyMadeRequest = await redis.get(`${processorUrl}:/payments/service-health`)
     if (alreadyMadeRequest) {
@@ -185,7 +223,7 @@ async function processWithProcessor(payment: any, processorUrl: string): Promise
   }
 }
 
-processPaymentQueue()
+startPaymentWorkers()
 
 const schema = {
   body: {
