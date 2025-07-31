@@ -50,6 +50,9 @@ async function saveProcessedPayment(payment: Payment, processor: 'default' | 'fa
   pipeline.zAdd(`payments:${processor}:by_date`, { score: timestamp, value: paymentData })
 
   await pipeline.exec()
+
+  // Log do pagamento salvo
+  console.log(`💾 Payment saved: ${payment.correlationId} | $${payment.amount} | ${processor} processor | ${new Date(timestamp).toISOString()}`)
 }
 
 async function getPaymentsSummary(from?: string, to?: string) {
@@ -120,12 +123,15 @@ async function processPaymentWorker(workerId: number) {
       }
 
       if (batch.length > 0) {
+        // Select optimal processor based on health and minResponseTime
+        const optimalProcessor = await selectOptimalProcessor()
+
         const promises = batch.map(payment =>
-          processPaymentWithProcessor(payment, 'default')
+          processPaymentDirect(payment, optimalProcessor)
         )
 
         await Promise.all(promises)
-        console.log(`Processed batch of ${batch.length}, queue size: ${queueSize}`)
+        console.log(`Worker ${workerId}: Processed batch of ${batch.length} via ${optimalProcessor}, queue size: ${queueSize}`)
 
       } else {
         // Se não há itens, espera um pouco antes de tentar novamente
@@ -196,13 +202,125 @@ async function processPaymentWithProcessor(
   }
 }
 
+type ProcessorHealth = {
+  failing: boolean
+  minResponseTime: number
+}
+
+async function getProcessorHealth(processorUrl: string): Promise<ProcessorHealth | null> {
+  try {
+    const response = await fetch(processorUrl + '/payments/service-health')
+
+    await redis.setEx(`health_check:${processorUrl}`, 5, '1')
+
+    if (!response.ok) return null
+
+    const health = await response.json() as ProcessorHealth
+
+    // Cache health info for 5 seconds
+    await redis.setEx(`health_data:${processorUrl}`, 5, JSON.stringify(health))
+
+    return health
+  } catch {
+    return null
+  }
+}
+
 async function isProcessorHealthy(processorUrl: string): Promise<boolean> {
-  const response = await fetch(processorUrl + '/payments/service-health')
-  await redis.setEx(`${processorUrl}:/payments/service-health`, 5, '1');
-  if (!response.ok) return false
-  const health = await response.json()
-  if (health.failing === false) return true
-  return false
+  const health = await getProcessorHealth(processorUrl)
+  return health ? !health.failing : false
+}
+
+async function selectOptimalProcessor(): Promise<'default' | 'fallback'> {
+  try {
+    // Check if we can get cached health data first (avoid rate limits)
+    const [defaultCache, fallbackCache] = await Promise.all([
+      redis.get(`health_data:${defaultProcessorUrl}`),
+      redis.get(`health_data:${fallbackProcessorUrl}`)
+    ])
+
+    let defaultHealth: ProcessorHealth | null = null
+    let fallbackHealth: ProcessorHealth | null = null
+
+    // Parse cached data
+    if (defaultCache) {
+      defaultHealth = JSON.parse(defaultCache)
+    }
+    if (fallbackCache) {
+      fallbackHealth = JSON.parse(fallbackCache)
+    }
+
+    // If no cached data, check if we can make health requests (respect rate limits)
+    const [canCheckDefault, canCheckFallback] = await Promise.all([
+      redis.get(`health_check:${defaultProcessorUrl}`),
+      redis.get(`health_check:${fallbackProcessorUrl}`)
+    ])
+
+    // Get fresh health data if not rate limited
+    if (!canCheckDefault && !defaultHealth) {
+      defaultHealth = await getProcessorHealth(defaultProcessorUrl)
+    }
+    if (!canCheckFallback && !fallbackHealth) {
+      fallbackHealth = await getProcessorHealth(fallbackProcessorUrl)
+    }
+
+    // Select best processor based on health and minResponseTime
+    const defaultHealthy = defaultHealth && !defaultHealth.failing
+    const fallbackHealthy = fallbackHealth && !fallbackHealth.failing
+
+    // If both are healthy, choose the one with lower response time
+    if (defaultHealthy && fallbackHealthy) {
+      const defaultTime = defaultHealth!.minResponseTime
+      const fallbackTime = fallbackHealth!.minResponseTime
+
+      console.log(`Both processors healthy - Default: ${defaultTime}ms, Fallback: ${fallbackTime}ms`)
+      return defaultTime <= fallbackTime ? 'default' : 'fallback'
+    }
+
+    // If only one is healthy, use it
+    if (defaultHealthy) {
+      console.log(`Only default processor healthy (${defaultHealth!.minResponseTime}ms)`)
+      return 'default'
+    }
+    if (fallbackHealthy) {
+      console.log(`Only fallback processor healthy (${fallbackHealth!.minResponseTime}ms)`)
+      return 'fallback'
+    }
+
+    // If neither is confirmed healthy, default to 'default' (better fees)
+    console.log('No health info available, defaulting to default processor')
+    return 'default'
+
+  } catch (error) {
+    console.error('Error selecting optimal processor:', error)
+    return 'default'
+  }
+}
+
+async function processPaymentDirect(payment: Payment, processorType: 'default' | 'fallback'): Promise<void> {
+  try {
+    const processorUrl = processorType === 'default' ? defaultProcessorUrl : fallbackProcessorUrl
+    const fallbackProcessorType = processorType === 'default' ? 'fallback' : 'default'
+
+    // Try primary processor
+    const success = await processWithProcessor(payment, processorUrl)
+    if (success) {
+      await saveProcessedPayment(payment, processorType)
+      return
+    }
+
+    // Try fallback processor
+    const fallbackUrl = processorType === 'default' ? fallbackProcessorUrl : defaultProcessorUrl
+    const fallbackSuccess = await processWithProcessor(payment, fallbackUrl)
+    if (fallbackSuccess) {
+      await saveProcessedPayment(payment, fallbackProcessorType)
+      return
+    }
+
+    console.error(`Both processors failed for payment: ${payment.correlationId}`)
+  } catch (error) {
+    console.error(`Payment processing error: ${payment.correlationId}`, error)
+  }
 }
 
 async function processWithProcessor(payment: any, processorUrl: string): Promise<boolean> {
@@ -218,7 +336,10 @@ async function processWithProcessor(payment: any, processorUrl: string): Promise
       body: JSON.stringify(paymentRequest),
     })
     return response.ok
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.name !== 'TimeoutError') {
+      console.error('Payment processing error:', error.message)
+    }
     return false
   }
 }
