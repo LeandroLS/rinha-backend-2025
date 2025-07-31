@@ -34,10 +34,20 @@ type Payment = {
 
 async function saveProcessedPayment(payment: Payment, processor: 'default' | 'fallback') {
   const pipeline = redis.multi()
+  const timestamp = Date.now()
 
   // Stats globais (sem data)
   pipeline.hIncrBy(`stats:${processor}`, 'totalRequests', 1)
   pipeline.hIncrByFloat(`stats:${processor}`, 'totalAmount', payment.amount)
+
+  // Sorted set para consultas por data (timestamp como score)
+  const paymentData = JSON.stringify({
+    correlationId: payment.correlationId,
+    amount: payment.amount,
+    processor,
+    processedAt: new Date(timestamp).toISOString()
+  })
+  pipeline.zAdd(`payments:${processor}:by_date`, { score: timestamp, value: paymentData })
 
   await pipeline.exec()
 }
@@ -62,32 +72,31 @@ async function getPaymentsSummary(from?: string, to?: string) {
     }
   }
 
-  const paymentKeys = await redis.keys('p:*')
-  const defaultResult = { totalRequests: 0, totalAmount: 0 }
-  const fallbackResult = { totalRequests: 0, totalAmount: 0 }
+  // Com filtro de data - usa sorted sets (performático)
+  const fromTimestamp = from ? new Date(from).getTime() : 0
+  const toTimestamp = to ? new Date(to).getTime() : Date.now()
 
-  const fromDate = from ? new Date(from) : new Date('1970-01-01')
-  const toDate = to ? new Date(to) : new Date()
+  const [defaultPayments, fallbackPayments] = await Promise.all([
+    redis.zRangeByScore('payments:default:by_date', fromTimestamp, toTimestamp),
+    redis.zRangeByScore('payments:fallback:by_date', fromTimestamp, toTimestamp)
+  ])
 
-  for (const key of paymentKeys) {
-    const payment = await redis.hGetAll(key)
-    const processedAt = new Date(payment.processedAt)
+  const calculateStats = (payments: string[]) => {
+    let totalRequests = 0
+    let totalAmount = 0
 
-    if (processedAt >= fromDate && processedAt <= toDate) {
-      const amount = parseFloat(payment.amount)
-      if (payment.processor === 'default') {
-        defaultResult.totalRequests++
-        defaultResult.totalAmount += amount
-      } else if (payment.processor === 'fallback') {
-        fallbackResult.totalRequests++
-        fallbackResult.totalAmount += amount
-      }
+    for (const paymentStr of payments) {
+      const payment = JSON.parse(paymentStr)
+      totalRequests++
+      totalAmount += payment.amount
     }
+
+    return { totalRequests, totalAmount }
   }
 
   return {
-    default: defaultResult,
-    fallback: fallbackResult
+    default: calculateStats(defaultPayments),
+    fallback: calculateStats(fallbackPayments)
   }
 }
 
@@ -98,16 +107,16 @@ async function addPaymentToQueue(paymentData: Payment) {
 async function processPaymentWorker(workerId: number) {
   while (true) {
     try {
-      const batchSize = 20
+      const queueSize = await redis.lLen('payment_queue')
+      const batchSize = Math.min(50, Math.max(5, Math.floor(queueSize / 20)))
       const batch = []
 
       for (let i = 0; i < batchSize; i++) {
         const item = await redis.rPop('payment_queue')
-        if (item) {
-          batch.push(JSON.parse(item))
-        } else {
+        if (!item) {
           break
         }
+        batch.push(JSON.parse(item))
       }
 
       if (batch.length > 0) {
@@ -116,14 +125,12 @@ async function processPaymentWorker(workerId: number) {
         )
 
         await Promise.all(promises)
-        const queueSize = await redis.lLen('payment_queue')
         console.log(`Processed batch of ${batch.length}, queue size: ${queueSize}`)
 
       } else {
         // Se não há itens, espera um pouco antes de tentar novamente
         await new Promise(resolve => setTimeout(resolve, 10))
       }
-
     } catch (error) {
       console.error(`Worker ${workerId} error:`, error)
       await new Promise(resolve => setTimeout(resolve, 100))
@@ -132,7 +139,7 @@ async function processPaymentWorker(workerId: number) {
 }
 
 async function startPaymentWorkers() {
-  const numWorkers = 10 // 4 workers por API (total 8)
+  const numWorkers = 12
 
   console.log(`Starting ${numWorkers} payment workers...`)
 
@@ -150,7 +157,6 @@ async function tryProcessor(
 ) {
   const success = await processWithProcessor(payment, processorUrl)
   if (success) {
-    // console.log(`${processorType} processor success, saving processment`)
     return await saveProcessedPayment(payment, processorType)
   }
   console.log(`${processorType} processor failed, trying ${processorType === 'default' ? 'fallback' : 'default'}`)
@@ -170,7 +176,6 @@ async function processPaymentWithProcessor(
     const fallbackProcessorType = processorType === 'default' ? 'fallback' : 'default'
 
     let isProcessorAvailable = false
-    // console.log(`Trying to process by ${processorType}: ${payment.correlationId}`)
 
     const alreadyMadeRequest = await redis.get(`${processorUrl}:/payments/service-health`)
     if (alreadyMadeRequest) {
@@ -207,13 +212,11 @@ async function processWithProcessor(payment: any, processorUrl: string): Promise
       amount: payment.amount,
       requestedAt: new Date().toISOString()
     }
-
     const response = await fetch(processorUrl + '/payments', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(paymentRequest)
+      body: JSON.stringify(paymentRequest),
     })
-
     return response.ok
   } catch {
     return false
