@@ -8,6 +8,7 @@ RUN npm ci
 
 COPY tsconfig.json ./
 COPY index.ts ./
+COPY src/ ./src/
 
 RUN npm run build
 RUN npm prune
