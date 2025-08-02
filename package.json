@@ -21,10 +21,12 @@
   "homepage": "https://github.com/LeandroLS/rinha-backend-2025#readme",
   "dependencies": {
     "fastify": "^5.4.0",
-    "redis": "^5.6.1"
+    "redis": "^5.6.1",
+    "pg": "^8.13.1"
   },
   "devDependencies": {
     "@types/node": "^24.1.0",
+    "@types/pg": "^8.15.5",
     "typescript": "^5.8.3"
   }
 }
