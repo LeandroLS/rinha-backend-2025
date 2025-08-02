@@ -15,8 +15,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.60'
-          memory: '90MB'
+          cpus: '0.45'
+          memory: '70MB'
 
   api2:
     <<: *api
@@ -31,8 +31,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.60'
-          memory: '90MB'
+          cpus: '0.45'
+          memory: '70MB'
   postgres:
     image: postgres:15-alpine
     environment:
@@ -52,8 +52,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.10'
-          memory: '95MB'
+          cpus: '0.50'
+          memory: '195MB'
 
   nginx:
     image: nginx:alpine

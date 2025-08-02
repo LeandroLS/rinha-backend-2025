@@ -1,9 +1,10 @@
 import Fastify from 'fastify'
 import { Pool } from 'pg'
 import { startProcessPaymentWorkers } from './src/worker.js'
+import { HealthChecker } from './src/health-checker.js'
 
 const fastify = Fastify({
-  logger: true
+  logger: false,
 })
 
 const pgPool = new Pool({
@@ -12,8 +13,8 @@ const pgPool = new Pool({
   database: 'rinha',
   user: 'rinha',
   password: 'rinha',
-  max: 5,
-  min: 1,
+  max: 35,
+  min: 2,
   idleTimeoutMillis: 15000,
   connectionTimeoutMillis: 10000,
   statement_timeout: 10000,
@@ -37,11 +38,6 @@ await Promise.all([
 type Payment = {
   amount: number,
   correlationId: string,
-}
-
-type ProcessorHealth = {
-  failing: boolean
-  minResponseTime: number
 }
 
 async function getPaymentsSummary(from?: string, to?: string) {
@@ -70,26 +66,10 @@ async function getPaymentsSummary(from?: string, to?: string) {
 
   return result
 }
+const healthChecker = new HealthChecker(pgPool, defaultProcessorUrl, fallbackProcessorUrl)
+healthChecker.startHealthMonitoring(6)
 
-// Initialize workers
-startProcessPaymentWorkers(pgPool, defaultProcessorUrl, fallbackProcessorUrl, 2)
-
-// Queue size monitor
-async function monitorQueueSize() {
-  while (true) {
-    try {
-      const { rows } = await pgPool.query('SELECT COUNT(*) as unprocessed FROM payment_queue WHERE processed = false')
-      const unprocessed = parseInt(rows[0].unprocessed)
-      console.log(`🔢 Queue Monitor: ${unprocessed} unprocessed payments`)
-    } catch (error) {
-      console.error('Error monitoring queue size:', error)
-    }
-    await new Promise(resolve => setTimeout(resolve, 5000))
-  }
-}
-
-// Start queue monitor
-monitorQueueSize()
+startProcessPaymentWorkers(pgPool, defaultProcessorUrl, fallbackProcessorUrl, healthChecker, 6)
 
 async function addPaymentToQueue(paymentData: Payment) {
   try {

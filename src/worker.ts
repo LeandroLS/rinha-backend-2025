@@ -1,4 +1,5 @@
 import { Pool } from 'pg'
+import { HealthChecker } from './health-checker.js'
 
 export type PaymentQueueItem = {
   id: number,
@@ -12,7 +13,8 @@ export type PaymentQueueItem = {
 export async function processPayment(
   pgPool: Pool,
   paymentQueueItem: PaymentQueueItem,
-  processorUrl: string
+  processorUrl: string,
+  processorType: 'default' | 'fallback'
 ): Promise<void> {
   try {
     const response = await fetch(processorUrl + '/payments', {
@@ -22,7 +24,8 @@ export async function processPayment(
         correlationId: paymentQueueItem.correlation_id,
         amount: paymentQueueItem.amount,
         requestedAt: new Date().toISOString(),
-      })
+      }),
+      signal: AbortSignal.timeout(500)
     })
 
     if (!response.ok) {
@@ -30,7 +33,7 @@ export async function processPayment(
       return await addPaymentBackToQueue(pgPool, false, paymentQueueItem.id)
     }
 
-    await setPaymentAsProcessed(pgPool, paymentQueueItem.id, paymentQueueItem.processor_type)
+    await setPaymentAsProcessed(pgPool, paymentQueueItem.id, processorType)
   } catch (error) {
     console.error(`Error processing payment with ${processorUrl}:`, error)
   }
@@ -40,7 +43,8 @@ async function processPaymentsWorker(
   pgPool: Pool,
   workerNumber: number,
   defaultProcessorUrl: string,
-  fallbackProcessorUrl: string
+  fallbackProcessorUrl: string,
+  healthChecker: HealthChecker
 ): Promise<void> {
   console.log(`Worker ${workerNumber} started`)
   while (true) {
@@ -48,27 +52,32 @@ async function processPaymentsWorker(
       const { rows } = await pgPool.query(`
         UPDATE payment_queue 
         SET processed = true 
-        WHERE id = (
+        WHERE id = ANY(
           SELECT id FROM payment_queue 
           WHERE processed = false 
           ORDER BY id 
-          LIMIT 1 
+          LIMIT 20
           FOR UPDATE SKIP LOCKED
         ) 
         RETURNING *
       `)
 
       if (rows.length === 0) {
-        await new Promise(resolve => setTimeout(resolve, 100))
+        await new Promise(resolve => setTimeout(resolve, 50))
         continue
       }
 
-      const payment = rows[0]
-      const processorUrl = payment.processor_type === 'default' ? defaultProcessorUrl : fallbackProcessorUrl
-      await processPayment(pgPool, payment, processorUrl)
+      const optimalProcessor = healthChecker.selectOptimalProcessor()
+      const processorUrl = optimalProcessor === 'default' ? defaultProcessorUrl : fallbackProcessorUrl
+
+      const batchPromises = rows.map(payment =>
+        processPayment(pgPool, payment, processorUrl, optimalProcessor)
+      )
+
+      await Promise.all(batchPromises)
     } catch (error) {
       console.error(`Worker ${workerNumber} error:`, error)
-      await new Promise(resolve => setTimeout(resolve, 500))
+      await new Promise(resolve => setTimeout(resolve, 100))
     }
   }
 }
@@ -77,10 +86,11 @@ export function startProcessPaymentWorkers(
   pgPool: Pool,
   defaultProcessorUrl: string,
   fallbackProcessorUrl: string,
+  healthChecker: HealthChecker,
   numWorkers: number = 5
 ): void {
   for (let i = 0; i < numWorkers; i++) {
-    processPaymentsWorker(pgPool, i + 1, defaultProcessorUrl, fallbackProcessorUrl)
+    processPaymentsWorker(pgPool, i + 1, defaultProcessorUrl, fallbackProcessorUrl, healthChecker)
   }
 }
 
